@@ -1,180 +1,144 @@
-# 🚚 Desafio Backend – Motor de Priorização de Reposição de Estoque
+# Parts API — Motor de Priorização de Reposição de Estoque
 
-## 🧩 Contexto
+Microserviço em Go para gerenciamento de peças com cálculo automático de
+prioridade de reposição baseado em estoque, consumo e criticidade.
 
-Somos um distribuidor de autopeças. Diariamente precisamos decidir **quais peças devem ser priorizadas para reposição**, considerando:
+## Stack
 
-- Estoque limitado
-- Capital de giro limitado
-- Diferentes níveis de criticidade
-- Padrões de venda distintos
-- Tempo de reposição do fornecedor
+- **Go 1.25+** — linguagem principal
+- **chi/v5** — roteador HTTP leve e idiomático
+- **SQLite** (`modernc.org/sqlite`, sem CGO) — banco local
+- **testify** — assertions nos testes
+- **slog** — structured logging nativo (zero dependência extra)
 
-O objetivo é construir um microserviço capaz de:
+## Como rodar
 
-1. Gerenciar peças em estoque
-2. Calcular automaticamente quais peças devem ser priorizadas para reposição
-3. Ordenar as peças por nível de urgência
-
----
-
-# 🛠️ Requisitos Funcionais
-
-## 1️⃣ CRUD de Peças
-
-Criar uma API para:
-
-- Criar peça
-- Listar peças
-- Atualizar peça
-- Remover peça
-- Buscar por categoria (opcional)
-
-### 📦 Estrutura da Entidade
-
-```json
-{
-  "id": "uuid",
-  "name": "Filtro de Óleo X",
-  "category": "engine",
-  "currentStock": 15,
-  "minimumStock": 20,
-  "averageDailySales": 4,
-  "leadTimeDays": 5,
-  "unitCost": 18.50,
-  "criticalityLevel": 3
-}
+```bash
+make run                        # sobe em :8080 com SQLite (arquivo parts.db)
+IN_MEMORY=true make run         # sobe com repositório em memória (sem disco)
+PORT=3000 make run              # porta customizada
 ```
 
-## 📝 Descrição dos Campos
+## Docker
 
-| Campo | Descrição |
-|--------|------------|
-| `currentStock` | Estoque atual disponível |
-| `minimumStock` | Estoque mínimo desejado |
-| `averageDailySales` | Média de vendas por dia |
-| `leadTimeDays` | Tempo (em dias) que o fornecedor demora para entregar a peça |
-| `unitCost` | Custo unitário da peça |
-| `criticalityLevel` | Nível de criticidade (1 a 5) |
+```bash
+docker build -t parts-api .
+docker run -p 8080:8080 parts-api                          # SQLite
+docker run -p 8081:8080 -e IN_MEMORY=true parts-api        # Memória
+docker compose up api-sqlite                                # Docker Compose SQLite
+docker compose up api-memory                                # Docker Compose Memória
+```
 
----
+## Como testar
 
-## 🧠 Endpoint de Priorização
+```bash
+make test                       # todos os testes com detector de race
+make test-unit                  # só unitários (rápido, sem I/O)
+make test-e2e                   # só E2E via httptest
+make fuzz                       # 30s de fuzzing no cálculo de urgência
+make bench                      # benchmarks (performance com até 10k peças)
+make lint                       # go vet
+make coverage                   # html de cobertura
+```
 
-Criar o endpoint:
+## Endpoints
 
-```GET /restock/priorities```
+### Criar peça
 
-Esse endpoint deve retornar as peças ordenadas por prioridade de reposição.
+```bash
+curl -s -X POST http://localhost:8080/api/v1/parts \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Filtro de Óleo X",
+    "category": "motor",
+    "currentStock": 15,
+    "minimumStock": 20,
+    "averageDailySales": 4,
+    "leadTimeDays": 5,
+    "unitCost": 18.50,
+    "criticalityLevel": 3
+  }' | jq
+```
 
----
+- `id` é opcional — se não enviado, o servidor gera UUID v4 automaticamente
+- `criticalityLevel` deve ser 1 a 5
+- Resposta `201 Created`
 
-## 📐 Regras de Negócio
+### Listar peças
 
-### 1️⃣ Calcular Consumo Esperado Durante o Lead Time
+```bash
+curl -s http://localhost:8080/api/v1/parts | jq
+curl -s "http://localhost:8080/api/v1/parts?category=motor" | jq
+curl -s "http://localhost:8080/api/v1/parts?needsRestock=true" | jq
+curl -s "http://localhost:8080/api/v1/parts?page=1&pageSize=20" | jq
+```
 
-```expectedConsumption = averageDailySales * leadTimeDays```
+### Buscar por ID
 
----
+```bash
+curl -s http://localhost:8080/api/v1/parts/550e8400-e29b-41d4-a716-446655440000 | jq
+```
 
-### 2️⃣ Calcular Estoque Projetado
+### Atualizar peça (campos parciais)
 
-```projectedStock = currentStock - expectedConsumption```
+```bash
+curl -s -X PUT http://localhost:8080/api/v1/parts/550e8400-e29b-41d4-a716-446655440000 \
+  -H "Content-Type: application/json" \
+  -d '{"currentStock": 30, "unitCost": 22.90}' | jq
+```
 
----
+### Remover peça
 
-### 3️⃣ Identificar Necessidade de Reposição
+```bash
+curl -s -X DELETE http://localhost:8080/api/v1/parts/550e8400-e29b-41d4-a716-446655440000
+```
 
-Uma peça precisa de reposição quando:
-```projectedStock < minimumStock```
+### Prioridades de reposição
 
+```bash
+curl -s http://localhost:8080/api/v1/restock/priorities | jq
+```
 
----
+Retorna todas as peças ordenadas por urgência, com tie-break.
 
-### 4️⃣ Calcular Score de Prioridade
+### Health check
 
-O score de prioridade deve ser calculado da seguinte forma:
+```bash
+curl -s http://localhost:8080/health | jq
+```
 
-```urgencyScore = (minimumStock - projectedStock) * criticalityLevel```
+## Regras de negócio
 
+```
+expectedConsumption = averageDailySales × leadTimeDays
+projectedStock      = currentStock − expectedConsumption
+needsRestock        = projectedStock < minimumStock
+urgencyScore        = (minimumStock − projectedStock) × criticalityLevel
+```
 
-Quanto maior o `urgencyScore`, maior a prioridade de reposição.
-
----
-
-## 🟰 Critérios de Desempate
-
-Em caso de empate no `urgencyScore`, aplicar:
-
+**Tie-break (mesmo urgencyScore):**
 1. Maior `criticalityLevel`
 2. Maior `averageDailySales`
-3. Ordem alfabética pelo nome da peça
+3. Ordem alfabética por `name`
 
----
+## Estrutura do projeto
 
-## 📤 Exemplo de Resposta
-
-```json
-{
-  "priorities": [
-    {
-      "partId": "uuid-1",
-      "name": "Filtro de Óleo X",
-      "currentStock": 15,
-      "projectedStock": 5,
-      "minimumStock": 20,
-      "urgencyScore": 45
-    },
-    {
-      "partId": "uuid-2",
-      "name": "Pastilha de Freio Y",
-      "currentStock": 8,
-      "projectedStock": -2,
-      "minimumStock": 10,
-      "urgencyScore": 36
-    }
-  ]
-}
+```
+cmd/api/main.go                     → entrypoint, graceful shutdown
+internal/
+  domain/                           → entidade Part + Value Objects puros
+  usecase/                          → orquestração CRUD + prioridades
+  repository/                       → interface PartRepository
+    memory/                         → implementação em memória (testes)
+    sqlite/                         → implementação SQLite (produção)
+  http/                             → handlers, rotas, DTOs, middleware
+test/
+  unit/                             → table-driven + fuzz + benchmarks + concorrência
+  e2e/                              → API real via httptest
 ```
 
-### 📌 Regras Gerais
+## Decisões
 
-- Não utilizar APIs externas.
-- O sistema deve estar preparado para suportar centenas ou milhares de peças.
-- A solução deve permitir futura troca de banco de dados.
-- O cálculo de prioridade deve estar isolado da camada HTTP.
-- Tratar corretamente casos de estoque negativo.
+As escolhas de arquitetura e os motivos estão em [`DECISIONS.md`](./DECISIONS.md).
 
-### 🎯 O Que Será Avaliado
-- 🧠 Modelagem de Domínio
-- Clareza das entidades
-- Separação de responsabilidades
-- Organização das regras de negócio
-
-### 🧪 Testes
-- Testes unitários do cálculo de prioridade
-- Testes de cenários extremos (estoque negativo, venda zero, lead time alto)
-
-### 🏗️ Arquitetura
-- Uso adequado de camadas (ex: Controller, Service, Domain, Repository)
-- Código limpo e organizado
-- Facilidade de manutenção
-
-### 🧰 Tecnologias
-
-Pode ser desenvolvido utilizando:
-
-- Node.js (com TypeScript)
-- Golang
-- Frameworks e bibliotecas são livres
-
-### 📄 Entrega
-
-O projeto deve conter:
-
-- Código-fonte organizado
-- README com instruções para rodar localmente
-- Exemplos de requisição
-- Testes automatizados
-
-Boa implementação 🚀
+O enunciado original do desafio está em [`README-TEST.md`](./README-TEST.md).
