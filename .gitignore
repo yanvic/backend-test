@@ -7,3 +7,4 @@ coverage.html
 dist/
 tmp/
 .env
+GUIA.md
